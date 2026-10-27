@@ -74,59 +74,71 @@ if ($Mode -eq 'build') {
 }
 
 if ($Mode -eq 'docker-build' -or $Mode -eq 'docker-push') {
-    # Linux 平台 Runner 不提供 Docker 守护进程；镜像在本机 Docker Desktop 构建、验收，
-    # 留在本机等 publish-release 成功后再推（同一条流水线只有这一台 Windows runner）。
+    # Linux 平台 Runner 不提供 Docker 守护进程；两个架构在本机 Docker Desktop 各自构建、
+    # 加载、验收，arm64 经 QEMU 运行。布局留在本机，等 publish-release 成功后再合成索引推送。
     $Match = Select-String -LiteralPath src/peach/__init__.py -Pattern '^__version__ = "([^"]+)"'
     if (-not $Match) { throw '无法读取发布版本' }
     $Version = $Match.Matches[0].Groups[1].Value
     Assert-ReleaseRef $Version
     $Endpoint = (docker context inspect --format '{{.Endpoints.docker.Host}}')
     Assert-Exit '需要运行 Docker Desktop'
-    $SourcePipeline = $env:CI_PIPELINE_ID
+    $Receipt = 'build/docker/receipt.json'
+    $Recorded = 'build/ci-artifacts/docker-image.json'
+    # 标签流水线是全新检出，演练验收过的布局按项目与提交留在本机 CI 构建根。
+    if (-not $env:CI_BUILDS_DIR) { throw '缺少 CI_BUILDS_DIR，无法保存镜像布局' }
+    $Layouts = Join-Path (Join-Path $env:CI_BUILDS_DIR '.peach-docker-layouts') `
+        (Join-Path $env:CI_PROJECT_ID $env:CI_COMMIT_SHA)
     if ($Mode -eq 'docker-push') {
         $CandidateReceipt = Get-Content -LiteralPath build/ci-artifacts/release-candidate.json -Raw -Encoding utf8 | ConvertFrom-Json
         if ($CandidateReceipt.target.pipeline -ne $env:CI_PIPELINE_ID -or $CandidateReceipt.target.commit -ne $env:CI_COMMIT_SHA) { throw '镜像晋级回执不属于当前发布' }
-        $SourcePipeline = $CandidateReceipt.candidate.identity.pipeline
     }
-    $Candidate = "peach-ci:$Version-$SourcePipeline"
 }
 
 if ($Mode -eq 'docker-build') {
     $Revision = (git rev-parse HEAD).Trim()
     Assert-Exit '无法读取提交'
     if ((Test-Path -LiteralPath build/ci-artifacts/docker-release-resume.json) -and (Get-Content -LiteralPath build/ci-artifacts/docker-release-resume.json -Raw | ConvertFrom-Json).restored) {
-        $Verified = Get-Content -LiteralPath build/ci-artifacts/docker-image.json -Raw -Encoding utf8 | ConvertFrom-Json
-        $Existing = docker image inspect --format '{{json .}}' $Candidate | ConvertFrom-Json
-        Assert-Exit '已登记的候选镜像不在本机，请重新执行演练'
-        if ($Existing.Id -ne $Verified.image_id -or $Existing.Config.Labels.'org.opencontainers.image.revision' -ne $Revision -or $Existing.Config.Labels.'org.opencontainers.image.version' -ne $Version) { throw '本机候选镜像与验收回执不一致' }
+        & (Get-Command python.exe).Source -X utf8 scripts/docker_image.py verify --receipt $Recorded --layouts $Layouts
+        Assert-Exit '已登记的镜像布局与回执不一致，请重新执行演练'
         exit 0
     }
-    docker build --pull --label "org.opencontainers.image.version=$Version" --label "org.opencontainers.image.revision=$Revision" `
-        --build-arg PEACH_SENTRY_DSN --build-arg PEACH_LIBRARY_SENTRY_DSN --build-arg PEACH_REQUIRE_REPORTING=1 -t $Candidate .
-    Assert-Exit '镜像构建失败'
-    try {
-        & (Get-Command python.exe).Source -X utf8 scripts/smoke_docker.py $Candidate
-        Assert-Exit '镜像验收失败'
-        docker run --rm --entrypoint python $Candidate -c 'from peach import library_sharing, remote_reporting, reporting_identity; assert remote_reporting.dsn() and library_sharing.target() and reporting_identity.distribution() == ''docker'''
-        Assert-Exit '镜像内 Sentry DSN 或分发标记缺失'
-    } catch {
-        docker image rm $Candidate | Out-Null
-        throw
+    if (Test-Path -LiteralPath $Layouts) { Remove-Item -LiteralPath $Layouts -Recurse -Force }
+    New-Item -ItemType Directory -Path $Layouts -Force | Out-Null
+    docker buildx inspect peach-docker *> $null
+    if ($LASTEXITCODE -ne 0) { docker buildx create --name peach-docker --driver docker-container --use | Out-Null }
+    else { docker buildx use peach-docker | Out-Null }
+    Assert-Exit '无法准备多架构构建器'
+    foreach ($Platform in @('linux/amd64', 'linux/arm64')) {
+        & (Get-Command python.exe).Source -X utf8 scripts/docker_image.py build --destination $Layouts `
+            --platform $Platform --version $Version --commit $Revision `
+            --build-arg PEACH_SENTRY_DSN --build-arg PEACH_LIBRARY_SENTRY_DSN --build-arg PEACH_REQUIRE_REPORTING=1
+        Assert-Exit "$Platform 镜像构建失败"
+        & (Get-Command python.exe).Source -X utf8 scripts/smoke_docker.py "peach-build:$($Platform.Split('/')[1])" --platform $Platform
+        Assert-Exit "$Platform 镜像验收失败"
     }
-    $ImageId = (docker image inspect --format '{{.Id}}' $Candidate).Trim()
-    Assert-Exit '无法读取已验收镜像摘要'
+    docker run --rm --platform linux/amd64 --entrypoint python 'peach-build:amd64' -c 'from peach import library_sharing, remote_reporting, reporting_identity; assert remote_reporting.dsn() and library_sharing.target() and reporting_identity.distribution() == ''docker'''
+    Assert-Exit '镜像内 Sentry DSN 或分发标记缺失'
+    & (Get-Command python.exe).Source -X utf8 scripts/docker_image.py record --receipt (Join-Path $Layouts 'amd64.json') --receipt (Join-Path $Layouts 'arm64.json') --version $Version --commit $Revision --destination $Receipt
+    Assert-Exit '无法合成多架构发布回执'
+    $Payload = Get-Content -LiteralPath $Receipt -Raw -Encoding utf8 | ConvertFrom-Json
+    $Payload | Add-Member -NotePropertyName pipeline -NotePropertyValue $env:CI_PIPELINE_ID -Force
     New-Item -ItemType Directory -Path build/ci-artifacts -Force | Out-Null
-    @{image=$Candidate; image_id=$ImageId; version=$Version; commit=$Revision; pipeline=$env:CI_PIPELINE_ID} | ConvertTo-Json | Set-Content -LiteralPath build/ci-artifacts/docker-image.json -Encoding utf8
+    $Payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Recorded -Encoding utf8
     exit 0
 }
 
 if ($Mode -eq 'docker-push') {
     if (-not $env:DOCKERHUB_USERNAME -or -not $env:DOCKERHUB_TOKEN) { throw '缺少 Docker Hub 发布变量' }
-    docker image inspect $Candidate | Out-Null
-    Assert-Exit "本机没有 docker-build 验收过的 $Candidate；重试 docker-build 后再推送"
-    $ActualImage = (docker image inspect --format '{{json .}}' $Candidate | ConvertFrom-Json)
-    Assert-Exit '无法读取候选镜像身份'
-    if ($ActualImage.Id -ne $CandidateReceipt.candidate.docker.image_id -or $ActualImage.Config.Labels.'org.opencontainers.image.revision' -ne $env:CI_COMMIT_SHA -or $ActualImage.Config.Labels.'org.opencontainers.image.version' -ne $Version) { throw '候选镜像与已验收的摘要、提交或版本不一致' }
+    # 标签流水线不下载演练布局：同一台 runner 上按回执核对已验收的布局，再合成索引推送。
+    $Expected = $CandidateReceipt.candidate.docker
+    if ($Expected.commit -ne $env:CI_COMMIT_SHA -or $Expected.version -ne $Version) {
+        throw '候选镜像不属于当前发布提交与版本'
+    }
+    $ExpectedPath = 'build/docker/candidate.json'
+    New-Item -ItemType Directory -Path build/docker -Force | Out-Null
+    $Expected | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ExpectedPath -Encoding utf8
+    & (Get-Command python.exe).Source -X utf8 scripts/docker_image.py verify --receipt $ExpectedPath --layouts $Layouts
+    Assert-Exit '本机没有演练验收过的镜像布局；重试 docker-build 后再推送'
     # 登录写进作业专用配置目录，不改动宿主用户的 Docker 登录。
     $SavedConfig, $SavedHost = $env:DOCKER_CONFIG, $env:DOCKER_HOST
     $env:DOCKER_HOST = $Endpoint
@@ -135,18 +147,14 @@ if ($Mode -eq 'docker-push') {
     try {
         $env:DOCKERHUB_TOKEN | docker login --username $env:DOCKERHUB_USERNAME --password-stdin
         Assert-Exit 'Docker Hub 登录失败'
-        foreach ($Tag in @($Version, 'edge')) {
-            docker tag $Candidate "longmeidao/peach:$Tag"
-            Assert-Exit '镜像标签失败'
-            docker push "longmeidao/peach:$Tag"
-            Assert-Exit "推送 longmeidao/peach:$Tag 失败"
-        }
+        & (Get-Command python.exe).Source -X utf8 scripts/docker_image.py publish --receipt $ExpectedPath --layouts $Layouts --tag $Version --tag edge
+        Assert-Exit '推送多架构镜像失败'
     } finally {
         docker logout | Out-Null
         Remove-Item -LiteralPath $env:DOCKER_CONFIG -Recurse -Force -ErrorAction SilentlyContinue
         $env:DOCKER_CONFIG, $env:DOCKER_HOST = $SavedConfig, $SavedHost
     }
-    docker image rm $Candidate | Out-Null
+    Remove-Item -LiteralPath $Layouts -Recurse -Force -ErrorAction SilentlyContinue
     exit 0
 }
 

@@ -317,8 +317,9 @@ smoke-windows:
     - uv run --no-project --with filelock==4.2.4 --python 3.14 python -X utf8 scripts/machine_lock.py -- pwsh -NoProfile -File ./release/ci_windows.ps1 smoke
     - if ($LASTEXITCODE -ne 0) { throw 'Windows 独立制品验收失败' }
 
-# 镜像先构建、冒烟，留在这台 runner 上；推送放在 publish-release 成功之后（publish-docker），
-# 安装包、R2 与 Release 任何一步没发出去，Docker Hub 的版本号与 edge 都不动。
+# 两个架构各自构建、加载、冒烟；单架构 OCI 布局留在本机，manifest digest 进回执。
+# 推送放在 publish-release 成功之后（publish-docker）：用 imagetools 合成索引再推
+# 版本号与 edge，安装包、R2 与 Release 任何一步没发出去，Docker Hub 的标签都不动。
 docker-build:
   stage: smoke
   tags: [peach-windows]
