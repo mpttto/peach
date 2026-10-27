@@ -358,6 +358,39 @@ class DockerImageTests(unittest.TestCase):
                                 for source in create))
             self.assertIn("longmeidao/peach:edge", create)
 
+    def test_publish_can_target_another_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            layouts = root / "build/docker"
+            _, amd_manifest, amd_config = self.layout(layouts, "amd64", "linux/amd64")
+            _, arm_manifest, arm_config = self.layout(layouts, "arm64", "linux/arm64")
+            receipt = {"format": 2, "image": "longmeidao/peach", "version": "1.2.3", "commit": "a" * 40,
+                       "platforms": {"linux/amd64": {"manifest": amd_manifest,
+                                                     "config": amd_config, "layout": "amd64"},
+                                     "linux/arm64": {"manifest": arm_manifest,
+                                                     "config": arm_config, "layout": "arm64"}}}
+            path = layouts / "receipt.json"
+            path.write_text(json.dumps(receipt))
+            raw = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                              "manifests": [
+                                  {"platform": {"os": "linux", "architecture": "amd64"}, "digest": amd_manifest},
+                                  {"platform": {"os": "linux", "architecture": "arm64"}, "digest": arm_manifest}]})
+
+            def run(command, **kwargs):
+                if command[:3] == ["docker", "buildx", "imagetools"] and command[3] == "create":
+                    metadata = Path(command[command.index("--metadata-file") + 1])
+                    metadata.write_text(json.dumps({"containerimage.descriptor": {
+                        "mediaType": "application/vnd.oci.image.index.v1+json",
+                        "digest": "sha256:" + hashlib.sha256(raw.encode()).hexdigest(), "size": 1}}))
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 0, raw, "")
+
+            result = docker_image.publish(path, ["fork-test"], layouts=layouts,
+                                          repository="tester/peach", run=run)
+            self.assertEqual(result["published"], ["tester/peach:fork-test"])
+            with self.assertRaisesRegex(docker_image.DockerImageError, "仓库名"):
+                docker_image.publish(path, ["fork-test"], layouts=layouts, repository="tester", run=run)
+
     def test_a_single_architecture_or_foreign_commit_cannot_be_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

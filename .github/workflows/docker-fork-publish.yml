@@ -1,0 +1,146 @@
+name: Docker fork 发布测试
+
+# 仅用于个人仓库验证多架构镜像发布：不要求版本提交、演练产物或标签。
+# 推到本分支或手动 dispatch 即构建两个架构、验收、合成索引并推送，
+# 目标仓库默认是 <DOCKERHUB_USERNAME>/peach，标签默认 fork-test（ADR-0129）。
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 推送目标仓库，留空则用 <DOCKERHUB_USERNAME>/peach
+        required: false
+        default: ''
+      tags:
+        description: 逗号分隔的镜像标签
+        required: false
+        default: fork-test
+  push:
+    branches: [test/docker-publish-fork]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-fork-publish
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Linux ${{ matrix.arch }} 镜像构建与验收
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: docker/setup-buildx-action@v4
+      - name: 构建并加载 ${{ matrix.arch }} 镜像
+        run: |
+          VERSION="$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')"
+          python scripts/docker_image.py build --destination build/docker \
+            --platform '${{ matrix.platform }}' \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --cache-from type=gha,scope=fork-docker-${{ matrix.arch }} \
+            --cache-to type=gha,mode=max,scope=fork-docker-${{ matrix.arch }}
+      - name: 验收 ${{ matrix.arch }}
+        run: python scripts/smoke_docker.py "peach-build:${{ matrix.arch }}" --platform '${{ matrix.platform }}'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fork-docker-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: |
+            build/docker/${{ matrix.arch }}
+            build/docker/${{ matrix.arch }}.json
+
+  record:
+    name: 合成发布回执
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: fork-docker-*
+          path: build/docker
+          merge-multiple: true
+      - name: 核对并登记
+        run: |
+          VERSION="$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')"
+          python scripts/docker_image.py record \
+            --receipt build/docker/amd64.json --receipt build/docker/arm64.json \
+            --version "$VERSION" --commit "$GITHUB_SHA" --destination build/docker/receipt.json
+          python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fork-docker-image
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: |
+            build/docker/amd64
+            build/docker/arm64
+            build/docker/amd64.json
+            build/docker/arm64.json
+            build/docker/receipt.json
+
+  publish:
+    name: 推送多架构镜像
+    needs: record
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_REPOSITORY: ${{ inputs.repository || format('{0}/peach', vars.DOCKERHUB_USERNAME) }}
+      TARGET_TAGS: ${{ inputs.tags || 'fork-test' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          name: fork-docker-image
+          path: build/docker
+      - name: 核对发布凭据
+        env:
+          USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$USERNAME" || { echo '缺少仓库变量 DOCKERHUB_USERNAME'; exit 1; }
+          test -n "$TOKEN" || { echo '缺少仓库机密 DOCKERHUB_TOKEN'; exit 1; }
+      - name: 核对演练布局与回执
+        run: python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: 合成索引并推送
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra tags <<< "$TARGET_TAGS"
+          for tag in "${tags[@]}"; do
+            tag="${tag// /}"
+            test -n "$tag"
+            args+=(--tag "$tag")
+          done
+          python scripts/docker_image.py publish \
+            --receipt build/docker/receipt.json --layouts build/docker \
+            --repository "$TARGET_REPOSITORY" "${args[@]}"
