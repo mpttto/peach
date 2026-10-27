@@ -17,11 +17,12 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from peach.user_agent import USER_AGENT
 
-REQUIRED_ARTIFACTS = {"desktop-candidate", "macos-candidate-arm64", "macos-candidate-x86_64", "docker-image"}
-REQUIRED_JOBS = {"Windows x64 独立测试包", "仅下载制品验收",
-    "Linux amd64 镜像构建与验收", "Linux arm64 镜像构建与验收", "Linux 多架构镜像登记",
-    "macOS arm64 独立测试包", "macOS x86_64 独立测试包",
+MACOS_ARTIFACTS = {"macos-candidate-arm64", "macos-candidate-x86_64"}
+MACOS_JOBS = {"macOS arm64 独立测试包", "macOS x86_64 独立测试包",
     "macOS arm64 仅下载制品验收", "macOS x86_64 仅下载制品验收"}
+REQUIRED_ARTIFACTS = {"desktop-candidate", "docker-image"} | MACOS_ARTIFACTS
+REQUIRED_JOBS = {"Windows x64 独立测试包", "仅下载制品验收",
+    "Linux amd64 镜像构建与验收", "Linux arm64 镜像构建与验收", "Linux 多架构镜像登记"} | MACOS_JOBS
 
 
 class ArtifactRedirect(HTTPRedirectHandler):
@@ -47,9 +48,11 @@ def api(repo: str, endpoint: str):
         return json.load(response)
 
 
-def select(repo: str, sha: str) -> dict:
+def select(repo: str, sha: str, *, macos: bool = True) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError("GitHub 晋级需要明确仓库与完整提交")
+    required_jobs = REQUIRED_JOBS if macos else REQUIRED_JOBS - MACOS_JOBS
+    required_artifacts = REQUIRED_ARTIFACTS if macos else REQUIRED_ARTIFACTS - MACOS_ARTIFACTS
     runs = api(repo, f"actions/workflows/release.yml/runs?head_sha={sha}&event=push&per_page=100")["workflow_runs"]
     matching = [row for row in runs if row["head_sha"] == sha and row["head_branch"] == "master" and row["event"] == "push"]
     if not matching:
@@ -59,11 +62,11 @@ def select(repo: str, sha: str) -> dict:
         raise ValueError("主线发布演练尚未成功")
     jobs = api(repo, f"actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
     passed = {row["name"] for row in jobs if row["conclusion"] == "success"}
-    if not REQUIRED_JOBS <= passed:
+    if not required_jobs <= passed:
         raise ValueError("演练缺少必需的构建或独立制品验收")
     artifacts = api(repo, f"actions/runs/{run['id']}/artifacts?per_page=100")["artifacts"]
-    selected = {row["name"]: row for row in artifacts if row["name"] in REQUIRED_ARTIFACTS and not row["expired"]}
-    if set(selected) != REQUIRED_ARTIFACTS or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", str(row.get("digest", ""))) for row in selected.values()):
+    selected = {row["name"]: row for row in artifacts if row["name"] in required_artifacts and not row["expired"]}
+    if set(selected) != required_artifacts or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", str(row.get("digest", ""))) for row in selected.values()):
         raise ValueError("候选产物已过期、缺失或缺少摘要；重新执行演练")
     return {"run_id": run["id"], "commit": sha, "artifacts": selected}
 
@@ -91,8 +94,8 @@ def extract(package: Path, destination: Path) -> None:
                 shutil.copyfileobj(source, stream)
 
 
-def download(repo: str, sha: str, group: str, destination: Path) -> dict:
-    receipt = select(repo, sha)
+def download(repo: str, sha: str, group: str, destination: Path, *, macos: bool = True) -> dict:
+    receipt = select(repo, sha, macos=macos)
     names = {"desktop": {"desktop-candidate"}, "macos": {"macos-candidate-arm64", "macos-candidate-x86_64"},
              "docker": {"docker-image"}}[group]
     destination.mkdir(parents=True, exist_ok=True)
@@ -114,8 +117,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("group", choices=("desktop", "macos", "docker"))
     parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument("--skip-macos", action="store_true",
+                        help="演练没有构建 macOS 时只核对 Windows 与镜像产物")
     args = parser.parse_args()
-    result = download(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"], args.group, args.destination)
+    result = download(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"], args.group,
+                      args.destination, macos=not args.skip_macos)
     print(json.dumps(result))
 
 

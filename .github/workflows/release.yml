@@ -35,11 +35,17 @@ jobs:
         with:
           python-version: '3.14'
       - name: 核对标签提交的主线 CI
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && github.repository == 'peach-mitao/peach'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python scripts/release_tag.py --repo "$GITHUB_REPOSITORY" --verify-sha "$GITHUB_SHA"
+          python -c 'import os; from pathlib import Path; from scripts.version_bump import read_version; assert os.environ["GITHUB_REF_NAME"] == "v" + read_version(Path.cwd()), "Tag 与版本不一致"'
+          python scripts/changelog.py --notes "${GITHUB_REF_NAME#v}" --to "$RUNNER_TEMP/release-notes.md"
+      # Fork 的 Test 有上游没有的环境差异；这里只核对标签与版本，演练与产物门槛保持不变。
+      - name: 核对标签与版本（Fork 跳过主线 Test 门槛）
+        if: github.ref_type == 'tag' && github.repository != 'peach-mitao/peach'
+        run: |
           python -c 'import os; from pathlib import Path; from scripts.version_bump import read_version; assert os.environ["GITHUB_REF_NAME"] == "v" + read_version(Path.cwd()), "Tag 与版本不一致"'
           python scripts/changelog.py --notes "${GITHUB_REF_NAME#v}" --to "$RUNNER_TEMP/release-notes.md"
 
@@ -176,6 +182,11 @@ jobs:
           Copy-Item scripts/smoke_desktop.py release/smoke_desktop.py
           Copy-Item scripts/smoke_update_tasks.py release/smoke_update_tasks.py
           Copy-Item scripts/smoke_split_update.py release/smoke_split_update.py
+          # 制品验收要在源码树外核对随包 amane 运行时，导入与锁文件一并随制品携带。
+          New-Item -ItemType Directory -Path release/scripts -Force | Out-Null
+          Copy-Item scripts/build_amane_runtime.py release/scripts/build_amane_runtime.py
+          New-Item -ItemType Directory -Path release/tools -Force | Out-Null
+          Copy-Item -Recurse tools/amane-bridge release/tools/amane-bridge
           python scripts/changelog.py --notes '${{ steps.version.outputs.version }}' --to release/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'CHANGELOG.md 缺这一版的一节，不发没有说明的版本' }
           Add-Content -LiteralPath release/RELEASE_NOTES.md -Value (Get-Content -Raw -Encoding utf8 release/DOWNLOADS.md) -Encoding utf8
@@ -191,6 +202,9 @@ jobs:
     needs: windows
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      # 随制品携带的 scripts/ 里有 build_amane_runtime.py，运行时自检从这里导入。
+      PYTHONPATH: scripts
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -259,7 +273,8 @@ jobs:
   macos:
     name: macOS ${{ matrix.arch }} 独立测试包
     needs: validate
-    if: github.ref_type != 'tag'
+    # Fork 的演练没有媒体工具缓存，先跳过 macOS，只验证 Windows 与多架构镜像。
+    if: github.ref_type != 'tag' && github.repository == 'peach-mitao/peach'
     strategy:
       fail-fast: false
       matrix:
@@ -319,6 +334,7 @@ jobs:
   macos-smoke:
     name: macOS ${{ matrix.arch }} 仅下载制品验收
     needs: macos
+    if: github.repository == 'peach-mitao/peach'
     strategy:
       fail-fast: false
       matrix:
@@ -368,11 +384,17 @@ jobs:
         with:
           python-version: '3.14'
       - name: 核对并取得同提交演练产物
+        if: github.repository == 'peach-mitao/peach'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python scripts/github_release_candidate.py desktop --destination release
           python scripts/github_release_candidate.py macos --destination macos-candidates
+      - name: 核对并取得同提交演练产物（Fork 不构建 macOS）
+        if: github.repository != 'peach-mitao/peach'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/github_release_candidate.py desktop --skip-macos --destination release
       - name: 创建预发布
         env:
           GH_TOKEN: ${{ github.token }}
@@ -380,10 +402,15 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           cd release
-          cp ../macos-candidates/release/*.dmg .
-          tail -n +4 ../macos-candidates/scripts/MACOS_DOWNLOADS.md >> RELEASE_NOTES.md
-          sha256sum ./*.zip ./*-setup.exe ./*.dmg > SHA256SUMS.txt
-          gh release create "$GITHUB_REF_NAME" ./*.zip ./*-setup.exe ./*.dmg SHA256SUMS.txt --verify-tag --prerelease --title "Peach ${VERSION#v} · Windows / macOS 测试版" --notes-file RELEASE_NOTES.md
+          if [ "$GITHUB_REPOSITORY" = "peach-mitao/peach" ]; then
+            cp ../macos-candidates/release/*.dmg .
+            tail -n +4 ../macos-candidates/scripts/MACOS_DOWNLOADS.md >> RELEASE_NOTES.md
+            sha256sum ./*.zip ./*-setup.exe ./*.dmg > SHA256SUMS.txt
+            gh release create "$GITHUB_REF_NAME" ./*.zip ./*-setup.exe ./*.dmg SHA256SUMS.txt --verify-tag --prerelease --title "Peach ${VERSION#v} · Windows / macOS 测试版" --notes-file RELEASE_NOTES.md
+          else
+            sha256sum ./*.zip ./*-setup.exe > SHA256SUMS.txt
+            gh release create "$GITHUB_REF_NAME" ./*.zip ./*-setup.exe SHA256SUMS.txt --verify-tag --prerelease --title "Peach ${VERSION#v} · Windows 测试版" --notes-file RELEASE_NOTES.md
+          fi
 
   # 每个架构在自己的原生 runner 上构建、加载、冒烟，演练只上传单架构 OCI 布局与回执；
   # 标签发布用 imagetools 合成索引，不重新构建（ADR-0127、ADR-0129）。
@@ -477,10 +504,18 @@ jobs:
         with:
           python-version: '3.14'
       - name: 取得并核对已验收布局
+        if: github.repository == 'peach-mitao/peach'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python scripts/github_release_candidate.py docker --destination build/docker
+          python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
+      - name: 取得并核对已验收布局（Fork 不构建 macOS）
+        if: github.repository != 'peach-mitao/peach'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/github_release_candidate.py docker --skip-macos --destination build/docker
           python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -488,11 +523,11 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: 合成并推送版本号与 edge
-        run: python scripts/docker_image.py publish --receipt build/docker/receipt.json --layouts build/docker --tag "${GITHUB_REF_NAME#v}" --tag edge
+        run: python scripts/docker_image.py publish --receipt build/docker/receipt.json --layouts build/docker --repository "${{ vars.DOCKERHUB_USERNAME }}/peach" --tag "${GITHUB_REF_NAME#v}" --tag edge
 
   project-board:
     name: 同步已发布版本到看板
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' && github.repository == 'peach-mitao/peach'
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 5

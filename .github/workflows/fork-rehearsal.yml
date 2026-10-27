@@ -4,7 +4,7 @@ name: Fork 演练
 # 手动运行走各自的主动入口（Release 只演练、不发布），推送与标签发布不变。
 on:
   push:
-    branches: [test/fork-rehearsal]
+    branches: [test/fork-rehearsal, test/release-fork]
 
 permissions:
   actions: write
@@ -24,6 +24,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh workflow run test.yml --ref "$GITHUB_REF_NAME"
-          gh workflow run release.yml --ref "$GITHUB_REF_NAME"
-          gh workflow run docker.yml --ref "$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_NAME" = "test/release-fork" ]; then
+            # 发布链测试只跑 Release 演练；Test 的 fork 环境差异另行处理。
+            gh workflow run release.yml --ref "$GITHUB_REF_NAME"
+          else
+            gh workflow run test.yml --ref "$GITHUB_REF_NAME"
+            gh workflow run release.yml --ref "$GITHUB_REF_NAME"
+            gh workflow run docker.yml --ref "$GITHUB_REF_NAME"
+          fi
