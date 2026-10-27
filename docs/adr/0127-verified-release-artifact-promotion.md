@@ -16,9 +16,19 @@ GitLab 的产物按项目、流水线、完整提交、版本和生成作业隔�
 
 R2 上传前，把完成构建的字节和清单保存在 `CI_BUILDS_DIR/.peach-upload-resume/` 的同项目、流水线、提交与产物组目录。传输失败后优先核对这份备份并续传到原生成作业前缀，不重新构建；远端完成清单登记成功后删除本组备份。备份缺失、机器已更换或文件校验失败时分别报告，不把网络失败当作没有构建结果。
 
-GitHub 从相同提交、主线推送触发的成功 Release 演练读取产物。必需的构建和制品验收任务须成功，产物须未过期且具有服务端 SHA-256；下载后核对摘要再展开。镜像保存为演练产物，发布前核对加载后的 image ID、版本与提交。REST 请求使用 CI 提供的短期令牌，跨主机下载重定向移除认证头。
+GitHub 从相同提交、主线推送触发的成功 Release 演练读取产物。必需的构建和制品验收任务须成功，产物须未过期且具有服务端 SHA-256；下载后核对摘要再展开。镜像保存为演练产物：两个平台的 OCI 布局与合并回执，发布前按回执重新核对布局里每个 blob 的 digest、版本与提交。REST 请求使用 CI 提供的短期令牌，跨主机下载重定向移除认证头。
 
-GitLab 的 Docker 候选镜像保留在完成演练的 Windows runner，清单记录 image ID。发布必须取得同一个镜像及对应提交、版本，镜像丢失或被替换时停止，重新执行演练。桌面文件与 GitGud Release 就绪后才推版本镜像和 `edge`，发布顺序沿用 ADR-0121。
+GitLab 的 Docker 候选布局保留在完成演练的 Windows runner 的构建根，清单记录两个平台各自的 manifest digest。发布必须取得同一份布局及对应提交、版本，布局缺失或 digest 不符时停止，重新执行演练。桌面文件与 GitGud Release 就绪后才推版本镜像和 `edge`，发布顺序沿用 ADR-0121。
+
+### 容器镜像
+
+镜像提供 `linux/amd64` 与 `linux/arm64`。Apple Silicon 的 Docker Desktop 运行 arm64，Intel Mac、x86_64 VPS 与常见 x86 NAS 运行 amd64，ARM NAS 运行 arm64；darwin 不是容器平台，不发布对应镜像。
+
+每个架构在自己的构建任务里构建一次，同时产出两份内容一致的产物：`type=docker` 归档加载进本机 Docker 供冒烟，`type=oci` 布局留在磁盘上供发布；归档加载成功后即删除，磁盘上只留布局。Dockerfile 不按架构分支，基础镜像与 uv 镜像都提供两个架构。GitHub 用原生 runner，amd64 在 `ubuntu-latest`、arm64 在 `ubuntu-24.04-arm`，都不经过模拟；GitLab 只有一台 Windows Docker Desktop runner，arm64 由 Docker Desktop 自带的 QEMU 运行。构建不使用多平台归档，也不需要 containerd image store。
+
+镜像身份取每个平台的 manifest digest：OCI 布局与 registry 都携带同一份 digest，发布前可以按它逐块核对字节，演练与发布不必落在同一台机器上。单架构回执记录该架构的 manifest digest、config digest 与布局目录，发布回执把两个平台合并并带上版本与提交。标签只在发布时出现：`docker buildx imagetools create` 从磁盘上的两个布局合成一个索引，同一索引推送到版本号与 `edge`，再从 registry 读回逐个平台核对。两个 CI 都可以对同一组标签独立发布，后发布者覆盖为它自己构建并验收的索引；不同 forge 的 digest 不同不构成冲突。
+
+容器冒烟覆盖两个平台的应用行为、软件转码回退、人脸模型离线加载与运行时架构断言。ARM NAS 与 Apple Silicon 的实机播放、ARM SoC 或 AMD/Intel GPU 的硬件转码属于部署机器验收，不在容器验收范围内。
 
 ## 容量、缓存与回收
 

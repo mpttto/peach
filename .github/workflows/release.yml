@@ -423,78 +423,110 @@ jobs:
           sha256sum ./*.zip ./*-setup.exe ./*.dmg > SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" ./*.zip ./*-setup.exe ./*.dmg SHA256SUMS.txt --verify-tag --prerelease --title "Peach ${VERSION#v} · Windows / macOS 测试版" --notes-file RELEASE_NOTES.md
 
-  # 镜像在演练中构建和验收，标签核对相同 image ID 后发布；发布排在 GitHub Release 成功之后：
-  # 桌面包任何一步没发出去，Docker Hub 的版本号与 edge 都不动（ADR-0121）。
+  # 每个架构在自己的原生 runner 上构建、加载、冒烟，演练只上传单架构 OCI 布局与回执；
+  # 标签发布用 imagetools 合成索引，不重新构建（ADR-0127）。
   docker:
-    name: Linux amd64 镜像构建与验收
+    name: Linux ${{ matrix.arch }} 镜像构建与验收
     needs: validate
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - uses: docker/setup-buildx-action@v4
-      - name: 读取镜像版本
-        id: version
-        run: echo "version=$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')" >> "$GITHUB_OUTPUT"
-      - name: 构建候选镜像
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          load: true
-          tags: longmeidao/peach:candidate
-          labels: |
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: 验收临时容器
-        run: python3 scripts/smoke_docker.py longmeidao/peach:candidate
-      - name: 保存已验收镜像与摘要
+      - name: 构建并加载 ${{ matrix.arch }} 镜像
         run: |
-          python scripts/github_release_candidate.py image-record --version '${{ steps.version.outputs.version }}' --destination docker-image.json
-          docker image save longmeidao/peach:candidate | gzip > docker-image.tar.gz
+          VERSION="$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')"
+          python scripts/docker_image.py build --destination build/docker \
+            --platform '${{ matrix.platform }}' \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --cache-from type=gha,scope=docker-${{ matrix.arch }} \
+            --cache-to type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: 验收 ${{ matrix.arch }}
+        run: python scripts/smoke_docker.py "peach-build:${{ matrix.arch }}" --platform '${{ matrix.platform }}'
       - uses: actions/upload-artifact@v7
         with:
-          name: docker-candidate
+          name: docker-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
           path: |
-            docker-image.json
-            docker-image.tar.gz
+            build/docker/${{ matrix.arch }}
+            build/docker/${{ matrix.arch }}.json
+
+  docker-record:
+    name: Linux 多架构镜像登记
+    needs: docker
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: docker-*
+          path: build/docker
+          merge-multiple: true
+      - name: 合成发布回执
+        run: |
+          VERSION="$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')"
+          python scripts/docker_image.py record \
+            --receipt build/docker/amd64.json --receipt build/docker/arm64.json \
+            --version "$VERSION" --commit "$GITHUB_SHA" --destination build/docker/receipt.json
+          python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            build/docker/amd64
+            build/docker/arm64
+            build/docker/amd64.json
+            build/docker/arm64.json
+            build/docker/receipt.json
 
   docker-publish:
     name: 发布已验收镜像
     if: github.ref_type == 'tag' && vars.DOCKERHUB_USERNAME != ''
     needs: [release, validate]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
-      - name: 取得并核对已验收镜像
+      - name: 取得并核对已验收布局
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python scripts/github_release_candidate.py docker --destination docker-candidate
-          docker image load --input docker-candidate/docker-image.tar.gz
-          python scripts/github_release_candidate.py image-verify --version "${GITHUB_REF_NAME#v}" --destination docker-candidate/docker-image.json
+          python scripts/github_release_candidate.py docker --destination build/docker
+          python scripts/docker_image.py verify --receipt build/docker/receipt.json --layouts build/docker
+      - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: 推送版本号与 edge
-        run: |
-          for tag in "${GITHUB_REF_NAME#v}" edge; do
-            docker tag longmeidao/peach:candidate "longmeidao/peach:$tag"
-            docker push "longmeidao/peach:$tag"
-          done
+      - name: 合成并推送版本号与 edge
+        run: python scripts/docker_image.py publish --receipt build/docker/receipt.json --layouts build/docker --tag "${GITHUB_REF_NAME#v}" --tag edge
 
   project-board:
     name: 同步已发布版本到看板

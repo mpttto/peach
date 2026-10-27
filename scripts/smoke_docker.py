@@ -51,6 +51,21 @@ def ready(name: str) -> None:
     raise RuntimeError("容器未就绪：" + docker("logs", name))
 
 
+def platform_checks(name: str, platform: str) -> None:
+    """容器实际运行的架构必须与验收平台一致。"""
+    expected = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}[platform]
+    actual = docker("exec", name, "python", "-c", "import platform; print(platform.machine())")
+    assert actual == expected, (actual, expected)
+
+
+def vision_checks(name: str) -> None:
+    """随镜像分发的 OpenCV 与 YuNet 模型在目标架构上可加载。"""
+    docker("exec", name, "python", "-c",
+           "from peach.face_detect import FaceDetector; "
+           "detector = FaceDetector(allow_download=False); "
+           "assert detector.model_path.is_file(), detector.model_path")
+
+
 def transcode_checks(name: str) -> None:
     """无 GPU 的容器核对 VAAPI 软件栈与应用的整片、分片软件回退。"""
     assert "vaapi" in docker("exec", name, "ffmpeg", "-hide_banner", "-hwaccels")
@@ -98,16 +113,16 @@ def amane_checks(name: str) -> None:
     assert bridge["installed"] is True and bridge["revision"] == manifest["revision"], bridge
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image")
-    args = parser.parse_args()
+def run(image: str, *, platform: str | None = None) -> None:
     name = "peach-smoke-" + uuid.uuid4().hex[:12]
     volume = name + "-data"
     try:
         docker("volume", "create", volume)
-        docker("run", "-d", "--name", name, "--network", "none",
-               "--mount", f"type=volume,source={volume},target=/data", args.image)
+        command = ["run", "-d", "--name", name, "--network", "none",
+                   "--mount", f"type=volume,source={volume},target=/data"]
+        if platform:
+            command += ["--platform", platform]
+        docker(*command, image)
         ready(name)
         assert docker("exec", name, "id", "-u") == "1000"
         assert json.loads(request(name, "/api/items")) is not None
@@ -137,6 +152,9 @@ def main() -> None:
         assert asset is not None, "资料处理请求未登记测试视频"
         media = json.loads(request(name, f"/stream?id={asset}", headers={"Range": "bytes=0-63"}))
         assert media == {"status": 206, "size": 64}, media
+        if platform:
+            platform_checks(name, platform)
+        vision_checks(name)
         transcode_checks(name)
         amane_checks(name)
         config_path = "/data/config.toml"
@@ -155,12 +173,22 @@ def main() -> None:
         docker("restart", "--time", "75", name)
         ready(name)
         assert docker("exec", name, "cat", config_path) == original
-        print(json.dumps({"image": args.image, "checks": ["non-root", "ready", "auth", "configuration",
-                                                         "scan", "range", "vaapi-stack", "transcode-fallback",
-                                                         "amane-prerequisites", "reload", "restart", "persistence"]}))
+        checks = ["non-root", "ready", "auth", "configuration", "scan", "range", "vision",
+                  "vaapi-stack", "transcode-fallback", "amane-prerequisites", "reload", "restart", "persistence"]
+        if platform:
+            checks.append("architecture")
+        print(json.dumps({"image": image, "platform": platform, "checks": checks}))
     finally:
         docker("rm", "--force", name, check=False)
         docker("volume", "rm", volume, check=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image")
+    parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
+    args = parser.parse_args()
+    run(args.image, platform=args.platform)
 
 
 if __name__ == "__main__":

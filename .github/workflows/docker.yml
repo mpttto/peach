@@ -1,13 +1,15 @@
 name: Docker
 
 # 只验收不发布：镜像的版本号与 edge 由 release.yml 在 GitHub Release 成功后推送，
-# edge 始终指向最新发布的版本（ADR-0121）。
+# edge 始终指向最新发布的版本（ADR-0121）。每个架构在自己的原生 runner 上构建、
+# 加载、冒烟；演练上传单架构 OCI 布局与回执，标签流水线用 imagetools 合成索引
+# 并推送，不重新构建（ADR-0127）。
 on:
   pull_request:
-    paths: [Dockerfile, .dockerignore, compose.yaml, 'src/**', 'migrations/**', 'web/**', 'resources/**', pyproject.toml, uv.lock, setup.py, MANIFEST.in, scripts/smoke_docker.py, .github/workflows/docker.yml]
+    paths: [Dockerfile, .dockerignore, compose.yaml, 'src/**', 'migrations/**', 'web/**', 'resources/**', pyproject.toml, uv.lock, setup.py, MANIFEST.in, scripts/docker_image.py, scripts/smoke_docker.py, .github/workflows/docker.yml]
   push:
     branches: [master]
-    paths: [Dockerfile, .dockerignore, compose.yaml, 'src/**', 'migrations/**', 'web/**', 'resources/**', pyproject.toml, uv.lock, setup.py, MANIFEST.in, scripts/smoke_docker.py, .github/workflows/docker.yml]
+    paths: [Dockerfile, .dockerignore, compose.yaml, 'src/**', 'migrations/**', 'web/**', 'resources/**', pyproject.toml, uv.lock, setup.py, MANIFEST.in, scripts/docker_image.py, scripts/smoke_docker.py, .github/workflows/docker.yml]
   workflow_dispatch:
 
 permissions:
@@ -20,22 +22,41 @@ concurrency:
 
 jobs:
   image:
-    name: Linux amd64 镜像验收
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: Linux ${{ matrix.arch }} 镜像构建与验收
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - uses: docker/setup-buildx-action@v4
-      - name: 构建候选镜像
-        uses: docker/build-push-action@v7
+      - name: 构建并加载 ${{ matrix.arch }} 镜像
+        run: |
+          VERSION="$(PYTHONPATH=src python -c 'from peach import __version__; print(__version__)')"
+          python scripts/docker_image.py build --destination build/docker \
+            --platform '${{ matrix.platform }}' \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --cache-from type=gha,scope=docker-${{ matrix.arch }} \
+            --cache-to type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: 验收 ${{ matrix.arch }}
+        run: python scripts/smoke_docker.py "peach-build:${{ matrix.arch }}" --platform '${{ matrix.platform }}'
+      - uses: actions/upload-artifact@v7
         with:
-          context: .
-          load: true
-          tags: longmeidao/peach:test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: 验收临时容器
-        run: python3 scripts/smoke_docker.py longmeidao/peach:test
+          name: docker-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            build/docker/${{ matrix.arch }}
+            build/docker/${{ matrix.arch }}.json

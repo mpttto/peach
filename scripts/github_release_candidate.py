@@ -8,7 +8,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from urllib.parse import urlsplit
@@ -18,8 +17,9 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from peach.user_agent import USER_AGENT
 
-REQUIRED_ARTIFACTS = {"desktop-candidate", "macos-candidate-arm64", "macos-candidate-x86_64", "docker-candidate"}
-REQUIRED_JOBS = {"Windows x64 独立测试包", "仅下载制品验收", "Linux amd64 镜像构建与验收",
+REQUIRED_ARTIFACTS = {"desktop-candidate", "macos-candidate-arm64", "macos-candidate-x86_64", "docker-image"}
+REQUIRED_JOBS = {"Windows x64 独立测试包", "仅下载制品验收",
+    "Linux amd64 镜像构建与验收", "Linux arm64 镜像构建与验收", "Linux 多架构镜像登记",
     "macOS arm64 独立测试包", "macOS x86_64 独立测试包",
     "macOS arm64 仅下载制品验收", "macOS x86_64 仅下载制品验收"}
 
@@ -94,7 +94,7 @@ def extract(package: Path, destination: Path) -> None:
 def download(repo: str, sha: str, group: str, destination: Path) -> dict:
     receipt = select(repo, sha)
     names = {"desktop": {"desktop-candidate"}, "macos": {"macos-candidate-arm64", "macos-candidate-x86_64"},
-             "docker": {"docker-candidate"}}[group]
+             "docker": {"docker-image"}}[group]
     destination.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="peach-candidate-") as directory:
         for name in sorted(names):
@@ -110,34 +110,12 @@ def download(repo: str, sha: str, group: str, destination: Path) -> dict:
     return {"promoted": True, "run_id": receipt["run_id"], "commit": sha, "group": group}
 
 
-def image_receipt(destination: Path, version: str, *, verify: bool) -> dict:
-    actual = json.loads(subprocess.check_output(["docker", "image", "inspect", "--format", "{{json .}}",
-                                                "longmeidao/peach:candidate"], text=True, encoding="utf-8"))
-    labels = actual.get("Config", {}).get("Labels", {})
-    sha = os.environ["GITHUB_SHA"]
-    if labels.get("org.opencontainers.image.revision") != sha or labels.get("org.opencontainers.image.version") != version:
-        raise ValueError("镜像标签与发布提交或版本不一致")
-    expected = {"image_id": actual["Id"], "commit": sha, "version": version}
-    if verify:
-        if json.loads(destination.read_text(encoding="utf-8")) != expected:
-            raise ValueError("镜像与演练验收的摘要不一致")
-    else:
-        destination.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
-    return expected
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("group", choices=("desktop", "macos", "docker", "image-record", "image-verify"))
+    parser.add_argument("group", choices=("desktop", "macos", "docker"))
     parser.add_argument("--destination", required=True, type=Path)
-    parser.add_argument("--version")
     args = parser.parse_args()
-    if args.group.startswith("image-"):
-        if not args.version:
-            parser.error("镜像核验需要版本")
-        result = image_receipt(args.destination, args.version, verify=args.group == "image-verify")
-    else:
-        result = download(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"], args.group, args.destination)
+    result = download(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"], args.group, args.destination)
     print(json.dumps(result))
 
 

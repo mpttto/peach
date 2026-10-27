@@ -13,6 +13,7 @@ import zipfile
 from unittest import mock
 
 from scripts import ci_r2_artifacts as artifacts
+from scripts import docker_image
 from scripts import release_candidate as candidate
 from scripts import github_release_candidate as github
 from scripts.release_forge import REQUIRED_TEST_JOBS, REHEARSAL_JOBS
@@ -27,8 +28,11 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.names = sorted((REQUIRED_TEST_JOBS | REHEARSAL_JOBS) - {"seal-release"})
         self.jobs = {name: {"id": index + 10, "status": "success", "commit": {"id": "a" * 40}}
                      for index, name in enumerate(self.names)}
-        self.docker = {"commit": "a" * 40, "pipeline": "7", "version": "1.2.3",
-            "image": "peach-ci:1.2.3-7", "image_id": "sha256:" + "b" * 64}
+        self.docker = {"format": 2, "commit": "a" * 40, "pipeline": "7", "version": "1.2.3",
+            "platforms": {platform: {"manifest": "sha256:" + digest * 64, "config": "sha256:" + config * 64,
+                                     "layout": arch}
+                          for platform, digest, config, arch in (
+                              ("linux/amd64", "d", "1", "amd64"), ("linux/arm64", "e", "2", "arm64"))}}
         self.paths = {"windows-release": "release/Peach-1.2.3-windows-x64.zip",
             "macos-release": "dist/macos.noindex/arm64/Peach-1.2.3-macos-arm64.dmg",
             "docker-release": "build/ci-artifacts/docker-image.json"}
@@ -55,7 +59,8 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_changed_commit_failed_checks_or_replaced_mirror_are_rejected(self):
         mutations = (lambda data: data["identity"].update(commit="c" * 40),
                      lambda data: data["jobs"].update({self.names[0]: 999}),
-                     lambda data: data["docker"].update(image="unrelated:latest"))
+                     lambda data: data["docker"].update(platforms={
+                         "linux/amd64": data["docker"]["platforms"]["linux/amd64"]}))
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory, \
                     mock.patch.dict(os.environ, self.environment, clear=True), \
@@ -160,20 +165,33 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.assertEqual((target / self.paths["windows-release"]).read_bytes(), b"verified windows-release")
             self.assertEqual(json.loads((target / self.paths["docker-release"]).read_text()), self.docker)
 
-
-@unittest.skipUnless(shutil.which("pwsh"), "需要 PowerShell 7 执行 Windows 发布入口")
+@unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"),
+                     "Windows 发布入口在 runner 上调用 python.exe，只能在 Windows 上执行")
 class DockerPublicationTests(unittest.TestCase):
-    def test_failed_push_retains_verified_image_and_success_removes_it(self):
+    def test_failed_publish_keeps_the_verified_layouts_and_success_removes_them(self):
         entry = Path(__file__).resolve().parents[1] / "scripts/ci_windows.ps1"
-        image = {"Id": "sha256:" + "b" * 64, "Config": {"Labels": {
-            "org.opencontainers.image.revision": "a" * 40, "org.opencontainers.image.version": "1.2.3"}}}
+        platforms = {platform: {"manifest": "sha256:" + digest * 64, "config": "sha256:" + config * 64,
+                                "layout": arch}
+                     for platform, digest, config, arch in (
+                         ("linux/amd64", "d", "1", "amd64"), ("linux/arm64", "e", "2", "arm64"))}
+        docker = {"format": 2, "commit": "a" * 40, "pipeline": "7", "version": "1.2.3",
+                  "platforms": platforms}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             (root / "src/peach").mkdir(parents=True)
             (root / "src/peach/__init__.py").write_text('__version__ = "1.2.3"')
+            (root / "scripts").mkdir()
+            (root / "scripts/docker_image.py").write_text(
+                'import os, pathlib, sys\n'
+                'command = sys.argv[1]\n'
+                'if command == "verify":\n'
+                '    raise SystemExit(0 if pathlib.Path(sys.argv[-1]).is_dir() else 2)\n'
+                'if command == "publish":\n'
+                '    raise SystemExit(int(os.environ.get("TEST_FAIL_PUSH", "0")))\n'
+                'raise SystemExit(3)\n', encoding="utf-8")
             (root / "build/ci-artifacts").mkdir(parents=True)
             receipt = {"target": {"pipeline": "8", "commit": "a" * 40},
-                       "candidate": {"identity": {"pipeline": "7"}, "docker": {"image_id": image["Id"]}}}
+                       "candidate": {"identity": {"pipeline": "7"}, "docker": docker}}
             (root / "build/ci-artifacts/release-candidate.json").write_text(json.dumps(receipt))
             driver = root / "driver.ps1"
             driver.write_text('''function docker {
@@ -182,24 +200,187 @@ class DockerPublicationTests(unittest.TestCase):
     Add-Content -LiteralPath calls.log -Value ($DockerArgs -join ' ')
     $global:LASTEXITCODE = 0
     if ($DockerArgs[0] -eq 'context') { return 'fixture-endpoint' }
-    if ($DockerArgs[0] -eq 'image' -and $DockerArgs[1] -eq 'inspect') { return $env:TEST_IMAGE }
-    if ($DockerArgs[0] -eq 'push' -and $env:TEST_FAIL_PUSH -eq '1') { $global:LASTEXITCODE = 1 }
 }
 try { & $env:TEST_CI_ENTRY docker-push } catch { Write-Output $_; exit 3 }
 ''', encoding="utf-8")
-            environment = {**os.environ, "TEST_CI_ENTRY": str(entry), "TEST_IMAGE": json.dumps(image),
-                "CI_PIPELINE_ID": "8", "CI_COMMIT_SHA": "a" * 40, "CI_COMMIT_TAG": "v1.2.3",
-                "PEACH_RELEASE_REHEARSAL": "", "DOCKERHUB_USERNAME": "fixture", "DOCKERHUB_TOKEN": "fixture"}
+            builds = root / "builds"
+            layouts = builds / ".peach-docker-layouts/123" / ("a" * 40)
+            environment = {**os.environ, "TEST_CI_ENTRY": str(entry), "CI_BUILDS_DIR": str(builds),
+                "CI_PROJECT_ID": "123", "CI_PIPELINE_ID": "8", "CI_COMMIT_SHA": "a" * 40,
+                "CI_COMMIT_TAG": "v1.2.3", "PEACH_RELEASE_REHEARSAL": "",
+                "DOCKERHUB_USERNAME": "fixture", "DOCKERHUB_TOKEN": "fixture"}
             for fail in (True, False):
                 with self.subTest(failed=fail):
                     log = root / "calls.log"
                     log.unlink(missing_ok=True)
+                    for arch in ("amd64", "arm64"):
+                        (layouts / arch).mkdir(parents=True, exist_ok=True)
+                        (layouts / f"{arch}.json").write_text("{}")
                     result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-File", str(driver)],
                         cwd=root, env={**environment, "TEST_FAIL_PUSH": str(int(fail))}, text=True, encoding="utf-8", capture_output=True)
                     calls = log.read_text(encoding="utf-8-sig")
                     self.assertEqual(result.returncode == 0, not fail, (result.stdout or "") + (result.stderr or ""))
-                    self.assertEqual("image rm peach-ci:1.2.3-7" in calls, not fail)
+                    self.assertEqual(layouts.exists(), fail)
+                    self.assertIn("login", calls)
                     self.assertIn("logout", calls)
+
+
+class DockerImageTests(unittest.TestCase):
+    amd64_manifest = "sha256:" + "1" * 64
+    amd64_config = "sha256:" + "2" * 64
+    arm64_manifest = "sha256:" + "3" * 64
+    arm64_config = "sha256:" + "4" * 64
+    index = "sha256:" + "5" * 64
+
+    def layout(self, root: Path, arch: str, platform: str) -> tuple[Path, str, str]:
+        """写一个最小 OCI 布局：index、manifest、config 与一个图层，digest 按内容计算。"""
+        folder = root / arch
+        blobs = folder / "blobs/sha256"
+        blobs.mkdir(parents=True, exist_ok=True)
+        layer = ("layer " + arch).encode()
+        layer_digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+        config = json.dumps({"architecture": arch}).encode()
+        config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+        document = {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                               "digest": config_digest, "size": len(config)},
+                    "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                                "digest": layer_digest, "size": len(layer)}]}
+        manifest = json.dumps(document).encode()
+        manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+        (blobs / config_digest.split(":", 1)[1]).write_bytes(config)
+        (blobs / manifest_digest.split(":", 1)[1]).write_bytes(manifest)
+        (blobs / layer_digest.split(":", 1)[1]).write_bytes(layer)
+        (folder / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [
+            {"mediaType": document["mediaType"], "digest": manifest_digest, "size": len(manifest),
+             "platform": {"os": "linux", "architecture": arch}}]}))
+        return folder, manifest_digest, config_digest
+
+    def build(self, root: Path, platform: str = "linux/amd64") -> tuple[dict, list[list[str]]]:
+        destination = root / "build/docker"
+        arch = platform.split("/")[1]
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            if command[:3] == ["docker", "buildx", "build"]:
+                _, manifest, _ = self.layout(destination, arch, platform)
+                (destination / f"{arch}-build.json").write_text(json.dumps({"containerimage.digest": manifest}))
+                (destination / f"{arch}.tar").write_bytes(b"docker archive")
+            elif command[:2] == ["docker", "load"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            elif command[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({
+                    "org.opencontainers.image.version": "1.2.3",
+                    "org.opencontainers.image.revision": "a" * 40}), "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(docker_image, "ROOT", root):
+            receipt = docker_image.build(destination, platform=platform, version="1.2.3",
+                                         commit="a" * 40, run=run)
+        return receipt, commands
+
+    def test_build_loads_the_single_architecture_and_writes_a_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            receipt, commands = self.build(root)
+            self.assertEqual(receipt["platform"], "linux/amd64")
+            self.assertTrue(docker_image.DIGEST.fullmatch(receipt["manifest"]))
+            self.assertTrue(docker_image.DIGEST.fullmatch(receipt["config"]))
+            self.assertEqual(receipt["layout"], "amd64")
+            build = commands[0]
+            self.assertIn("type=oci", " ".join(build))
+            self.assertIn("type=docker", " ".join(build))
+            self.assertNotIn("--load", build, "加载由回执核对后的 docker load 完成")
+            self.assertIn("--platform", build)
+            self.assertEqual(build[build.index("--platform") + 1], "linux/amd64")
+            self.assertIn(["--provenance=false", "--sbom=false"], [build[i:i + 2] for i in range(len(build) - 1)])
+            self.assertIn("docker", commands[1][0])
+
+    def test_verify_rejects_a_changed_receipt_or_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            receipt, _ = self.build(root)
+            destination = root / "build/docker"
+            path = destination / "receipt.json"
+            combined = {"format": 2, "image": "longmeidao/peach", "version": "1.2.3", "commit": "a" * 40,
+                        "platforms": {"linux/amd64": {"manifest": receipt["manifest"],
+                                                      "config": receipt["config"], "layout": "amd64"}}}
+            path.write_text(json.dumps(combined))
+            with self.assertRaises(docker_image.DockerImageError):
+                docker_image.verify(path, layouts=destination)
+            _, arm_manifest, arm_config = self.layout(destination, "arm64", "linux/arm64")
+            combined["platforms"]["linux/arm64"] = {"manifest": arm_manifest,
+                                                    "config": arm_config, "layout": "arm64"}
+            path.write_text(json.dumps(combined))
+            self.assertEqual(docker_image.verify(path, layouts=destination)["platforms"], combined["platforms"])
+            (destination / "amd64/blobs/sha256" / receipt["config"].split(":", 1)[1]).unlink()
+            with self.assertRaisesRegex(docker_image.DockerImageError, "config"):
+                docker_image.verify(path, layouts=destination)
+
+    def test_publish_merges_both_layouts_and_checks_the_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            layouts = root / "build/docker"
+            _, amd_manifest, amd_config = self.layout(layouts, "amd64", "linux/amd64")
+            _, arm_manifest, arm_config = self.layout(layouts, "arm64", "linux/arm64")
+            receipt = {"format": 2, "image": "longmeidao/peach", "version": "1.2.3", "commit": "a" * 40,
+                       "platforms": {"linux/amd64": {"manifest": amd_manifest,
+                                                     "config": amd_config, "layout": "amd64"},
+                                     "linux/arm64": {"manifest": arm_manifest,
+                                                     "config": arm_config, "layout": "arm64"}}}
+            path = layouts / "receipt.json"
+            path.write_text(json.dumps(receipt))
+            calls = []
+            raw = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                              "manifests": [
+                                  {"platform": {"os": "linux", "architecture": "amd64"}, "digest": amd_manifest},
+                                  {"platform": {"os": "linux", "architecture": "arm64"}, "digest": arm_manifest}]})
+            index = "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if command[:3] == ["docker", "buildx", "imagetools"] and command[3] == "create":
+                    metadata = Path(command[command.index("--metadata-file") + 1])
+                    metadata.write_text(json.dumps({"containerimage.descriptor": {
+                        "mediaType": "application/vnd.oci.image.index.v1+json", "digest": index, "size": 1}}))
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[:3] == ["docker", "buildx", "imagetools"]:
+                    return subprocess.CompletedProcess(command, 0, raw, "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            result = docker_image.publish(path, ["1.2.3", "edge"], layouts=layouts, run=run)
+            self.assertEqual(result["index"], index)
+            self.assertEqual(result["published"], ["longmeidao/peach:1.2.3", "longmeidao/peach:edge"])
+            create = calls[0]
+            self.assertTrue(any(source.startswith("oci-layout://") and source.endswith("@" + amd_manifest)
+                                for source in create))
+            self.assertTrue(any(source.startswith("oci-layout://") and source.endswith("@" + arm_manifest)
+                                for source in create))
+            self.assertIn("longmeidao/peach:edge", create)
+
+    def test_a_single_architecture_or_foreign_commit_cannot_be_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            amd64, _ = self.build(root)
+            path = root / "build/docker/amd64.json"
+            with self.assertRaisesRegex(docker_image.DockerImageError, "linux/arm64"):
+                docker_image.record([path], root / "receipt.json", version="1.2.3", commit="a" * 40)
+            arm64, _ = self.build(root, "linux/arm64")
+            with self.assertRaisesRegex(docker_image.DockerImageError, "提交或版本"):
+                docker_image.record([path, root / "build/docker/arm64.json"], root / "receipt.json",
+                                    version="1.2.3", commit="b" * 40)
+            combined = docker_image.record([path, root / "build/docker/arm64.json"], root / "receipt.json",
+                                           version="1.2.3", commit="a" * 40)
+            self.assertEqual(set(combined["platforms"]), {"linux/amd64", "linux/arm64"})
+            self.assertEqual(combined["platforms"]["linux/arm64"]["manifest"], arm64["manifest"])
+
+    def test_a_layout_with_the_wrong_platform_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = Path(directory)
+            self.layout(layout.parent, layout.name + "-amd", "linux/amd64")
+            with self.assertRaisesRegex(docker_image.DockerImageError, "linux/arm64"):
+                docker_image._layout_entry(layout.parent / (layout.name + "-amd"), "linux/arm64")
 
 
 class GitHubCandidateTests(unittest.TestCase):
@@ -262,14 +443,12 @@ class GitHubCandidateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 github.select("owner/repo", "a" * 40)
 
-    def test_loaded_docker_image_must_match_the_recorded_image_id(self):
-        image = {"Id": "sha256:" + "b" * 64, "Config": {"Labels": {
-            "org.opencontainers.image.version": "1.2.3", "org.opencontainers.image.revision": "a" * 40}}}
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}), \
-                mock.patch.object(github.subprocess, "check_output", side_effect=lambda *_a, **_kw: json.dumps(image)):
-            receipt = Path(directory) / "image.json"
-            github.image_receipt(receipt, "1.2.3", verify=False)
-            github.image_receipt(receipt, "1.2.3", verify=True)
-            image["Id"] = "sha256:" + "c" * 64
-            with self.assertRaises(ValueError):
-                github.image_receipt(receipt, "1.2.3", verify=True)
+    def test_docker_group_promotes_the_combined_receipt_without_a_tagged_image(self):
+        payload = self.payload("receipt.json")
+        record = {"run_id": 7, "artifacts": {"docker-image": {"id": 9,
+            "digest": "sha256:" + hashlib.sha256(payload).hexdigest()}}}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(github, "select", return_value=record), \
+                mock.patch.object(github, "request", side_effect=lambda *_: io.BytesIO(payload)):
+            root = Path(directory)
+            self.assertTrue(github.download("owner/repo", "a" * 40, "docker", root)["promoted"])
+            self.assertEqual((root / "receipt.json").read_bytes(), b"verified bytes")

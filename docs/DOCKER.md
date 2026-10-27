@@ -1,6 +1,6 @@
 # Docker 部署
 
-Peach 的 Docker 镜像用于单人 VPS 与 NAS，通过浏览器管理，镜像仓库为 [longmeidao/peach](https://hub.docker.com/r/longmeidao/peach)。每次发布推送版本号标签，并把 `edge` 更新为同一镜像；版本号标签对应发布提交。当前镜像目标为 `linux/amd64`；ARM NAS 尚未验收。2026-10-15 在 WSL 的独立 Docker Engine 中，用正式锁定依赖通过空数据卷初始化、非 root、鉴权、配置保存、合成视频扫描、HTTP Range、配置重载与重启持久化验收。
+Peach 的 Docker 镜像用于单人 VPS 与 NAS，通过浏览器管理，镜像仓库为 [longmeidao/peach](https://hub.docker.com/r/longmeidao/peach)。每次发布推送版本号标签，并把 `edge` 更新为同一份多架构索引；版本号标签对应发布提交。镜像同时提供 `linux/amd64` 与 `linux/arm64`：Apple Silicon 的 Docker Desktop 自动选择 arm64，Intel Mac、x86_64 VPS 与常见 x86 NAS 使用 amd64，ARM NAS 使用 arm64。2026-10-15 在 WSL 的独立 Docker Engine 中，用正式锁定依赖通过空数据卷初始化、非 root、鉴权、配置保存、合成视频扫描、HTTP Range、配置重载与重启持久化完成 amd64 验收；两个架构的同一套容器冒烟由 CI 分别执行，ARM 实机仍需在部署机器验证，见 [ADR-0127](adr/0127-verified-release-artifact-promotion.md)。
 
 Docker 不使用桌面托盘。在网页配置中添加媒体目录时，只需填写容器内实际目录，例如 `/media`；Peach 自动保存所需的路径配置。Windows 安装包、macOS 源码运行和 Docker 的入口分别见 [README](../README.md#下载与使用)。
 
@@ -103,7 +103,7 @@ Linux 首次重编码时会探测实际可用的硬件编码器，整片 MP4 与
 
 镜像自带 OpenCV（`vision` 依赖组）和头像取景与比对用的人脸模型（YuNet 为 MIT，SFace 为 Apache-2.0，许可证在同一目录），位于 `/app/tools/face-models`，由 `PEACH_FACE_MODELS` 指向，容器不联网也能用。构建镜像时按固定地址下载并校验 SHA-256。
 
-镜像包含 Debian FFmpeg、Mesa VAAPI 驱动与 `vainfo`。AMD 宿主机需加载 `amdgpu` 和对应固件，并提供 `/dev/dri/renderD*`。Intel 需在自定义镜像内安装适配设备的 VAAPI 驱动；Mesa 驱动不代表已覆盖全部 Intel GPU。将下面的条目合入 Compose 的 `services.peach`，设备路径按宿主机调整：
+镜像包含 Debian FFmpeg、Mesa VAAPI 驱动与 `vainfo`。AMD 宿主机需加载 `amdgpu` 和对应固件，并提供 `/dev/dri/renderD*`。Intel 需在自定义镜像内安装适配设备的 VAAPI 驱动；Mesa 驱动不代表已覆盖全部 Intel GPU。arm64 镜像包含同一组软件包；ARM SoC 的硬件编码通常还依赖厂商的内核驱动与 VAAPI 实现，镜像不随附，需在目标机器验证。将下面的条目合入 Compose 的 `services.peach`，设备路径按宿主机调整：
 
 ```yaml
     devices:
@@ -162,8 +162,8 @@ Linux 容器不读取用户电脑上的浏览历史，也不包含交互式浏�
 
 ## 镜像发布
 
-构建使用官方 Python `3.14.8-slim-trixie` 与 uv `0.13.1`，应用依赖与 amane 独立依赖分别由各自的 `uv.lock` 锁定。应用以非 editable 包安装，包含 Web 与迁移资源。镜像以 UID/GID 1000 运行，内置 FFmpeg、FFprobe、OpenSSL 和 amane 独立环境。uv 与 Git 只用于构建阶段。构建上下文只允许代码与资源，不包含工作树、媒体、真实 Peach 数据库或凭据。
+构建使用官方 Python `3.15.1-slim-trixie` 与 uv `0.13.6`，应用依赖与 amane 独立依赖分别由各自的 `uv.lock` 锁定。应用以非 editable 包安装，包含 Web 与迁移资源。镜像以 UID/GID 1000 运行，内置 FFmpeg、FFprobe、OpenSSL 和 amane 独立环境。uv 与 Git 只用于构建阶段。构建上下文只允许代码与资源，不包含工作树、媒体、真实 Peach 数据库或凭据。
 
-GitHub Actions 的 `Docker` 工作流先构建并运行临时卷验收，通过后发布。仓库变量 `DOCKERHUB_USERNAME` 和机密 `DOCKERHUB_TOKEN` 用于 Docker Hub 发布；机密只保存在 GitHub，不进入项目文件。未配置发布身份时仍执行构建验收。ARM 镜像需通过同等运行验收后再加入发布。
+两个架构各自在自己的 runner 上构建一次，同时产出加载进本机 Docker 供冒烟的 `type=docker` 归档与供发布用的 `type=oci` 布局，归档加载后删除；标签只在发布时出现：`docker buildx imagetools create` 从两个布局合成索引，打成版本号与 `edge`，推送后再从 registry 读回逐个平台核对。GitHub Actions 的 `Docker` 工作流只构建并运行两个架构的临时卷验收，不推送；版本号与 `edge` 由 `release.yml` 在 GitHub Release 成功后推送。GitLab 的 `docker-build` 在 Windows Docker Desktop runner 上构建并验收两个平台，arm64 经 Docker Desktop 自带的 QEMU 运行。仓库变量 `DOCKERHUB_USERNAME` 和机密 `DOCKERHUB_TOKEN` 用于 Docker Hub 发布；机密只保存在 GitHub 和 GitLab 的受保护变量中，不进入项目文件。未配置发布身份时仍执行构建验收。镜像身份、演练产物与发布核对见 [ADR-0127](adr/0127-verified-release-artifact-promotion.md)。
 
 Docker Hub 页面以英文为主，概览正文取自 [docs/dockerhub/README.md](dockerhub/README.md)，链接回 GitHub 的源码、本文和中文 README。简介填写 `Local-first video metadata scraper and media manager. Self-hosted web UI for VPS and NAS.`。发布流水线只推送镜像，概览与简介需要在 Docker Hub 仓库设置中手动更新；镜像、端口、目录或 Compose 示例变化时同批修改该文件。

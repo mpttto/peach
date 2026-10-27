@@ -83,13 +83,13 @@ Windows 原生 Runner 在深目录中检出项目时，需为 Git 启用 `core.l
 
 计划任务使用 `pythonw.exe` 调用 `scripts/run_gitlab_runner.py --root <runner目录>`，由启动器通过 `CREATE_NO_WINDOW` 运行原有 `run-runner.ps1`。PowerShell 的 `-WindowStyle Hidden` 不能保证不触发 Windows Terminal 托管，后台入口不直接以控制台程序作为计划任务动作。启动器日志保存在 runner 目录的 `runner-launcher.log`，runner 输出仍沿用 `runner.log`。
 
-版本标签须受保护。版本提交的演练完成三平台回归、固定来源媒体工具、Windows 完整包与拆分包、macOS 双架构 DMG、安装升级和镜像验收，再登记候选。标签核对相同提交、验证任务与文件摘要后发布已验收产物，不重新构建。`publish-release` 上传 R2 并创建 GitLab Release，`publish-docker` 排在它成功之后推送同一 image ID 的镜像；最终回收演练暂存。发布作业失败时重试同一作业，标签不动。项目流水线使用 `PEACH_DOWNLOAD_BACKEND=both`，同一份制品分别保存在 R2 与 GitGud Generic Package Registry；不把会过期的 job artifacts 当作永久下载地址。独立部署可明确选择 `r2` 或 `gitgud` 单后端。候选和发布顺序见 [ADR-0127](adr/0127-verified-release-artifact-promotion.md)。
+版本标签须受保护。版本提交的演练完成三平台回归、固定来源媒体工具、Windows 完整包与拆分包、macOS 双架构 DMG、安装升级和镜像验收，再登记候选。标签核对相同提交、验证任务与文件摘要后发布已验收产物，不重新构建。`publish-release` 上传 R2 并创建 GitLab Release，`publish-docker` 排在它成功之后推送与演练回执一致的同一份多架构镜像索引；最终回收演练暂存。发布作业失败时重试同一作业，标签不动。项目流水线使用 `PEACH_DOWNLOAD_BACKEND=both`，同一份制品分别保存在 R2 与 GitGud Generic Package Registry；不把会过期的 job artifacts 当作永久下载地址。独立部署可明确选择 `r2` 或 `gitgud` 单后端。候选和发布顺序见 [ADR-0127](adr/0127-verified-release-artifact-promotion.md)。
 
 Linux 发布任务使用官方 uv Python 3.14 容器，并在获取制品工具前核对解释器版本；源码归档使用 `tarfile` 的 `data` 过滤器解压。CI 的 `.npm/` 与 `.uv-cache/` 属于生成缓存，不计入源码工作区变化。
 
 Windows 安装覆盖与任务恢复验收允许 GitHub Actions，以及受保护版本标签或版本提交演练上的 GitLab `smoke-windows` 作业；主机已有 Peach 安装登记时拒绝执行。所有程序、账本与任务夹具均放在临时目录，安装与卸载完成后核对登记清理。`fetch_cloudflared.ps1` 的相对输出路径按 PowerShell 当前工作位置解析，下载仍须通过固定 SHA-256 校验。
 
-GitGud 的 Linux 平台 Runner 不提供 Docker 守护进程，Docker 镜像由 `docker-build` 作业在 Windows 原生 Runner 构建，宿主须运行 Docker Desktop。作业核对标签与版本，用 `smoke_docker.py` 验收临时容器，镜像留在本机；演练里验收完就删除。标签流水线上，`publish-docker` 等 `publish-release` 成功后才推送版本号与 `edge` 两个标签，所以 `edge` 只会指向已经完整发布的版本。`DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 放入受保护且隐藏的 CI 变量，环境作用域为 `release`；令牌只授予仓库读写。登录写入作业专用的临时 `DOCKER_CONFIG`，结束时登出并删除，不改动宿主用户的 Docker 登录。
+GitGud 的 Linux 平台 Runner 不提供 Docker 守护进程，Docker 镜像由 `docker-build` 作业在 Windows 原生 Runner 构建，宿主须运行 Docker Desktop；arm64 构建与冒烟经 Docker Desktop 自带的 QEMU 运行。作业逐个架构用 buildx 构建，同时得到加载进本机 Docker 的归档与留在磁盘上的 OCI 布局，归档加载后删除；再用 `smoke_docker.py` 验收临时容器；回执记录两个平台的 manifest 与 config digest，布局按项目与提交留在 runner 的 `CI_BUILDS_DIR` 下。标签流水线上，`publish-docker` 等 `publish-release` 成功后才按回执核对本机的同一份布局，用 `imagetools create` 合成索引并推送版本号与 `edge`，所以 `edge` 只会指向已经完整发布的版本。`DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 放入受保护且隐藏的 CI 变量，环境作用域为 `release`；令牌只授予仓库读写。登录写入作业专用的临时 `DOCKER_CONFIG`，结束时登出并删除，不改动宿主用户的 Docker 登录。
 
 媒体工具源码可通过 `PEACH_SOURCE_CACHE_BASE` 指定 HTTPS 缓存入口，按 `<SHA-256>/<归档名>` 定位文件。标签流水线使用发布桶的 `_sources/` 前缀；维护者填充缓存前须核对锁文件的原始 SHA-256，缓存同样计入桶容量预算。下载缓存失败时尝试锁定的上游地址；任一来源的哈希不符立即拒绝，不能放宽清单。未配置缓存的对应源码包直接使用上游。
 

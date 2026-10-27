@@ -121,10 +121,15 @@ def seal(root: Path) -> dict:
 
 
 def validate_docker(docker: dict, build: dict) -> None:
-    if (docker.get("commit") != build["commit"] or docker.get("pipeline") != build["pipeline"]
-            or docker.get("version") != build["tag"][1:]
-            or docker.get("image") != f"peach-ci:{build['tag'][1:]}-{build['pipeline']}"
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(docker.get("image_id", "")))):
+    platforms = docker.get("platforms")
+    if (docker.get("format") != 2 or docker.get("commit") != build["commit"]
+            or docker.get("pipeline") != build["pipeline"] or docker.get("version") != build["tag"][1:]
+            or not isinstance(platforms, dict) or set(platforms) != {"linux/amd64", "linux/arm64"}
+            or not all(isinstance(entry, dict)
+                       and re.fullmatch(r"sha256:[0-9a-f]{64}", str(entry.get("manifest")))
+                       and re.fullmatch(r"sha256:[0-9a-f]{64}", str(entry.get("config")))
+                       and re.fullmatch(r"[A-Za-z0-9_.-]+", str(entry.get("layout")))
+                       for entry in platforms.values())):
         raise ValueError("Docker 候选镜像不属于同一提交与演练")
 
 
