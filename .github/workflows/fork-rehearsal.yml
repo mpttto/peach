@@ -1,0 +1,29 @@
+name: Fork 演练
+
+# 仅用于个人仓库：推送到测试分支后，用 workflow_dispatch 运行正式工作流。
+# 手动运行走各自的主动入口（Release 只演练、不发布），推送与标签发布不变。
+on:
+  push:
+    branches: [test/fork-rehearsal]
+
+permissions:
+  actions: write
+
+concurrency:
+  group: fork-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: 触发正式工作流
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 在测试分支运行 Test、Release 与 Docker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run test.yml --ref "$GITHUB_REF_NAME"
+          gh workflow run release.yml --ref "$GITHUB_REF_NAME"
+          gh workflow run docker.yml --ref "$GITHUB_REF_NAME"
