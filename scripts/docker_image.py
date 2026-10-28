@@ -29,6 +29,7 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 TOKEN = re.compile(r"[A-Za-z0-9_.-]+")
 SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMMIT = re.compile(r"[0-9a-f]{40}")
+REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)+")
 
 
 class DockerImageError(RuntimeError):
@@ -208,6 +209,8 @@ def publish(receipt_path: Path, tags: list[str], *, layouts: Path,
     """把两个单架构 manifest 合成索引，同一索引推送到每个标签并回读核对。"""
     if not tags or any(not TOKEN.fullmatch(tag) for tag in tags):
         raise DockerImageError("发布标签无效")
+    if not REPOSITORY.fullmatch(repository):
+        raise DockerImageError("镜像仓库名无效")
     receipt = verify(receipt_path, layouts=layouts)
     root = layouts.resolve()
     sources = [f"oci-layout://{(root / receipt['platforms'][platform]['layout']).resolve()}"
@@ -256,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     publishing = sub.add_parser("publish", help="合成多架构索引并推送")
     publishing.add_argument("--receipt", type=Path, required=True)
     publishing.add_argument("--layouts", type=Path, required=True)
+    publishing.add_argument("--repository", default=IMAGE)
     publishing.add_argument("--tag", action="append", required=True)
     args = parser.parse_args(argv)
     try:
@@ -268,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             result = verify(args.receipt, layouts=args.layouts)
         else:
-            result = publish(args.receipt, args.tag, layouts=args.layouts)
+            result = publish(args.receipt, args.tag, layouts=args.layouts,
+                             repository=args.repository)
     except (DockerImageError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
         print(f"镜像处理失败：{error}", file=sys.stderr)
         return 1
